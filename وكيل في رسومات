@@ -1,0 +1,17 @@
+You want to create an AI agent for cartoon movies using Typecast. 
+
+Typecast is an AI-powered text-to-speech platform that can convert text into natural voice narration in many languages with over 500 voices, including custom voice creation by instant cloning. It supports emotion control, pacing, and subtitle timing, which can be useful for animated content like cartoons.
+
+To build an AI agent for cartoon movies, you can:
+- Use Typecast API to generate speech audio from your cartoon scripts.
+- Choose voices that fit your characters from the available voice library or create custom voices.
+- Control emotions and expressions in the speech to match the cartoon scenes.
+- Integrate the API with your AI agent or app to automate voice generation for your cartoons.
+
+You can start by checking the Quickstart guide to create an API key and generate your first audio file. Also, explore the API Reference for detailed endpoints and parameters.
+
+If you want the AI agent to help you build this integration, you can use the AI agent implementation workflow with Claude, Cursor, or others, which can generate integration code for you.
+
+For more details, visit: https://typecast.ai/docs/overview
+
+If you want, I can help you prepare a text-to-speech request or guide you through the next steps.
