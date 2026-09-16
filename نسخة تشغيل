@@ -1,0 +1,234 @@
+from pathlib import Path
+import zipfile, shutil
+
+root=Path("/mnt/data/AI-Video-Dubbing-Platform-DEPLOY")
+if root.exists(): shutil.rmtree(root)
+(root/"backend/app").mkdir(parents=True)
+(root/"frontend").mkdir()
+(root/"nginx").mkdir()
+(root/"storage").mkdir()
+
+files={
+"docker-compose.yml":"""services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: dubbing
+      POSTGRES_PASSWORD: dubbing
+      POSTGRES_DB: dubbing
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    networks: [app]
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    networks: [app]
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    env_file: .env
+    expose: ["8000"]
+    depends_on: [db, redis]
+    volumes:
+      - ./storage:/app/storage
+    networks: [app]
+
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports: ["80:80"]
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./frontend:/usr/share/nginx/html:ro
+      - ./storage:/storage:ro
+    depends_on: [backend]
+    networks: [app]
+
+networks:
+  app:
+
+volumes:
+  postgres_data:
+""",
+".env.example":"""DATABASE_URL=postgresql+psycopg://dubbing:dubbing@db:5432/dubbing
+REDIS_URL=redis://redis:6379/0
+OPENAI_API_KEY=
+ELEVENLABS_API_KEY=
+DOMAIN=example.com
+""",
+".env":"""DATABASE_URL=postgresql+psycopg://dubbing:dubbing@db:5432/dubbing
+REDIS_URL=redis://redis:6379/0
+OPENAI_API_KEY=
+ELEVENLABS_API_KEY=
+DOMAIN=example.com
+""",
+"backend/Dockerfile":"""FROM python:3.12-slim
+RUN apt-get update && apt-get install -y ffmpeg curl && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app ./app
+RUN mkdir -p /app/storage
+HEALTHCHECK CMD curl -f http://localhost:8000/health || exit 1
+CMD ["uvicorn","app.main:app","--host","0.0.0.0","--port","8000"]
+""",
+"backend/requirements.txt":"""fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+psycopg[binary]
+redis
+httpx
+python-dotenv
+""",
+"backend/app/main.py":"""import json, shutil, subprocess
+from pathlib import Path
+from uuid import uuid4
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+
+BASE=Path("/app/storage"); BASE.mkdir(parents=True,exist_ok=True)
+app=FastAPI(title="AI Video Dubbing Platform",version="1.0.0")
+app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
+
+@app.get("/health")
+def health(): return {"status":"ok"}
+
+@app.get("/api")
+def api(): return {"name":"AI Video Dubbing Platform","version":"1.0.0"}
+
+@app.post("/api/projects")
+def create_project(name:str="مشروع جديد"):
+    pid=str(uuid4()); d=BASE/pid; d.mkdir()
+    state={"id":pid,"name":name,"status":"created","progress":0}
+    (d/"state.json").write_text(json.dumps(state,ensure_ascii=False))
+    return state
+
+@app.post("/api/projects/{pid}/upload")
+async def upload(pid:str,file:UploadFile=File(...)):
+    d=BASE/pid
+    if not d.exists(): raise HTTPException(404,"المشروع غير موجود")
+    if not file.filename: raise HTTPException(400,"ملف غير صالح")
+    if not (file.content_type or "").startswith("video/"):
+        raise HTTPException(400,"يسمح برفع ملفات الفيديو فقط")
+    target=d/"source.mp4"
+    with target.open("wb") as out: shutil.copyfileobj(file.file,out)
+    state=json.loads((d/"state.json").read_text()); state.update(status="uploaded",progress=10)
+    (d/"state.json").write_text(json.dumps(state,ensure_ascii=False))
+    return {"status":"uploaded","project_id":pid}
+
+@app.post("/api/projects/{pid}/extract-audio")
+def extract_audio(pid:str):
+    d=BASE/pid; src=d/"source.mp4"; out=d/"audio.wav"
+    if not src.exists(): raise HTTPException(404,"ارفع الفيديو أولاً")
+    p=subprocess.run(["ffmpeg","-y","-i",str(src),"-vn","-ac","1","-ar","16000","-c:a","pcm_s16le",str(out)],capture_output=True,text=True)
+    if p.returncode: raise HTTPException(500,p.stderr[-1000:])
+    state=json.loads((d/"state.json").read_text()); state.update(status="audio_ready",progress=20)
+    (d/"state.json").write_text(json.dumps(state,ensure_ascii=False))
+    return {"status":"audio_ready"}
+
+@app.post("/api/projects/{pid}/process")
+def process(pid:str,source_language:str="auto",target_language:str="ar"):
+    d=BASE/pid
+    if not (d/"source.mp4").exists(): raise HTTPException(404,"ارفع الفيديو أولاً")
+    state=json.loads((d/"state.json").read_text())
+    state.update(status="queued",progress=25,source_language=source_language,target_language=target_language,
+                 pipeline=["extract_audio","speech_to_text","speaker_timestamps","translate","srt","tts","sync","mix","render"])
+    (d/"state.json").write_text(json.dumps(state,ensure_ascii=False))
+    return state
+
+@app.get("/api/projects/{pid}/status")
+def status(pid:str):
+    f=BASE/pid/"state.json"
+    if not f.exists(): raise HTTPException(404,"المشروع غير موجود")
+    return json.loads(f.read_text())
+
+@app.get("/api/projects/{pid}/source")
+def source(pid:str):
+    f=BASE/pid/"source.mp4"
+    if not f.exists(): raise HTTPException(404,"الفيديو غير موجود")
+    return FileResponse(f,media_type="video/mp4")
+""",
+"nginx/default.conf":"""server {
+  listen 80;
+  server_name _;
+  client_max_body_size 2G;
+
+  root /usr/share/nginx/html;
+  index index.html;
+
+  location /api/ {
+    proxy_pass http://backend:8000/api/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_read_timeout 3600;
+  }
+
+  location /storage/ {
+    alias /storage/;
+  }
+
+  location / {
+    try_files $uri $uri/ /index.html;
+  }
+}
+""",
+"frontend/index.html":"""<!doctype html>
+<html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Dubbing</title>
+<style>
+body{margin:0;background:#0b1020;color:#eef2ff;font-family:Arial}header{padding:20px 7%;background:#131b31;font-size:24px;font-weight:bold}main{max-width:1100px;margin:auto;padding:28px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:18px}.card{background:#131b31;border:1px solid #293553;border-radius:18px;padding:22px;margin-bottom:18px}input,select{width:100%;padding:12px;margin:8px 0 14px;border-radius:10px;border:1px solid #394766;background:#0b1020;color:white}button{padding:12px 18px;border:0;border-radius:10px;font-weight:bold;cursor:pointer}.primary{background:white;color:#101828}.muted{color:#a6b2cd}#status{background:#050812;padding:15px;border-radius:12px;white-space:pre-wrap}
+</style></head><body><header>🎬 AI Video Dubbing Platform</header><main>
+<div class="card"><h1>دبلجة الفيديو بالذكاء الاصطناعي</h1><p class="muted">ارفع الفيديو، اختر اللغة، ثم ابدأ المعالجة.</p></div>
+<div class="grid">
+<div class="card"><h2>1. المشروع</h2><input id="name" value="مشروع جديد"><button class="primary" onclick="create()">إنشاء</button></div>
+<div class="card"><h2>2. الفيديو</h2><input id="file" type="file" accept="video/*"><button class="primary" onclick="upload()">رفع</button></div>
+<div class="card"><h2>3. الدبلجة</h2><select id="src"><option value="auto">اكتشاف تلقائي</option><option value="ar">العربية</option><option value="en">English</option></select><select id="dst"><option value="ar">العربية</option><option value="en">English</option><option value="tr">Türkçe</option></select><button class="primary" onclick="start()">ابدأ</button></div>
+</div><div class="card"><h2>الحالة</h2><div id="status">جاهز</div></div>
+</main><script>
+let pid="";const out=x=>document.getElementById("status").textContent=typeof x==="string"?x:JSON.stringify(x,null,2);
+async function create(){let r=await fetch("/api/projects?name="+encodeURIComponent(name.value),{method:"POST"});let d=await r.json();pid=d.id;out(d)}
+async function upload(){if(!pid)return out("أنشئ المشروع أولاً");let f=file.files[0];if(!f)return out("اختر فيديو");let fd=new FormData();fd.append("file",f);let r=await fetch("/api/projects/"+pid+"/upload",{method:"POST",body:fd});out(await r.json())}
+async function start(){if(!pid)return out("أنشئ المشروع أولاً");let r=await fetch("/api/projects/"+pid+"/process?source_language="+src.value+"&target_language="+dst.value,{method:"POST"});out(await r.json())}
+</script></body></html>""",
+"deploy.sh":"""#!/usr/bin/env bash
+set -e
+echo "Starting AI Video Dubbing Platform..."
+docker compose up -d --build
+echo "Platform is running."
+docker compose ps
+""",
+"README.md":"""# AI Video Dubbing Platform — Deployment
+
+## تشغيل محلي أو على VPS
+```bash
+cp .env.example .env
+docker compose up -d --build
+```
+
+ثم افتح:
+http://SERVER-IP
+
+## HTTPS
+اربط DNS للدومين إلى IP السيرفر، ثم استخدم Nginx + Certbot لإصدار شهادة Let's Encrypt.
+لا تضع مفاتيح API داخل GitHub.
+
+## مهم
+هذه البنية تشغل الموقع والـ API وPostgreSQL وRedis وFFmpeg.
+مراحل STT/Translation/TTS/Sync/Render هي نقاط ربط جاهزة، وتحتاج مزودات الذكاء الاصطناعي ومهام Workers للإنتاج الكامل.
+"""
+}
+for rel,c in files.items():
+    p=root/rel;p.parent.mkdir(parents=True,exist_ok=True);p.write_text(c,encoding="utf-8")
+(root/"deploy.sh").chmod(0o755)
+zip_path=Path("/mnt/data/AI-Video-Dubbing-Platform-DEPLOY.zip")
+if zip_path.exists(): zip_path.unlink()
+with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
+    for p in root.rglob("*"):
+        if p.is_file(): z.write(p,p.relative_to(root))
+print(zip_path)
